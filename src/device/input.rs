@@ -4,7 +4,7 @@ use super::common::Feature;
 use crate::config::{read_config, write_config, ReadOnly, WriteOnly};
 use crate::hal::Hal;
 use crate::queue::VirtQueue;
-use crate::transport::{InterruptStatus, Transport};
+use crate::transport::Transport;
 use crate::Error;
 use alloc::{boxed::Box, string::String};
 use core::cmp::min;
@@ -21,6 +21,8 @@ pub struct VirtIOInput<H: Hal, T: Transport> {
     event_queue: VirtQueue<H, QUEUE_SIZE>,
     status_queue: VirtQueue<H, QUEUE_SIZE>,
     event_buf: Box<[InputEvent; 32]>,
+    #[cfg(test)]
+    blocked: bool,
 }
 
 impl<H: Hal, T: Transport> VirtIOInput<H, T> {
@@ -58,16 +60,22 @@ impl<H: Hal, T: Transport> VirtIOInput<H, T> {
             event_queue,
             status_queue,
             event_buf,
+            #[cfg(test)]
+            blocked: false,
         })
     }
 
     /// Acknowledge interrupt and process events.
-    pub fn ack_interrupt(&mut self) -> InterruptStatus {
+    pub fn ack_interrupt(&mut self) -> bool {
         self.transport.ack_interrupt()
     }
 
     /// Pop the pending event.
     pub fn pop_pending_event(&mut self) -> Option<InputEvent> {
+        #[cfg(test)]
+        if self.blocked {
+            return None;
+        }
         if let Some(token) = self.event_queue.peek_used() {
             let event = &mut self.event_buf[token as usize];
             // SAFETY: We are passing the same buffer as we passed to `VirtQueue::add` and it is still valid.
@@ -196,6 +204,19 @@ impl<H: Hal, T: Transport> VirtIOInput<H, T> {
             Err(Error::IoError)
         }
     }
+
+    /// Blocks the event queue, preventing `pop_pending_event()` from returning events.
+    /// This is useful for testing buffer-full scenarios.
+    #[cfg(test)]
+    pub fn block_event_queue(&mut self) {
+        self.blocked = true;
+    }
+
+    /// Unblocks the event queue, allowing `pop_pending_event()` to return events normally.
+    #[cfg(test)]
+    pub fn unblock_event_queue(&mut self) {
+        self.blocked = false;
+    }
 }
 
 // SAFETY: The config space can be accessed from any thread.
@@ -289,7 +310,7 @@ pub struct DevIDs {
 /// Both queues use the same `virtio_input_event` struct. `type`, `code` and `value`
 /// are filled according to the Linux input layer (evdev) interface.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, FromBytes, Immutable, IntoBytes, KnownLayout)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, Immutable, IntoBytes, KnownLayout, PartialEq)]
 pub struct InputEvent {
     /// Event type.
     pub event_type: u16,
@@ -415,5 +436,76 @@ mod tests {
         for (i, &byte) in value.into_iter().enumerate() {
             config_space.data[i].0 = byte;
         }
+    }
+
+    #[test]
+    fn test_block_event_queue() {
+        const DEFAULT_DATA: ReadOnly<u8> = ReadOnly::new(0);
+        let config_space = Config {
+            select: WriteOnly::default(),
+            subsel: WriteOnly::default(),
+            size: ReadOnly::new(0),
+            _reserved: Default::default(),
+            data: [DEFAULT_DATA; 128],
+        };
+        let state = Arc::new(Mutex::new(State::new(
+            vec![QueueStatus::default(), QueueStatus::default()],
+            config_space,
+        )));
+        let transport = FakeTransport {
+            device_type: DeviceType::Input,
+            max_queue_size: QUEUE_SIZE.try_into().unwrap(),
+            device_features: 0,
+            state: state.clone(),
+        };
+        let mut input = VirtIOInput::<FakeHal, FakeTransport<Config>>::new(transport).unwrap();
+
+        // Initially, there should be no events since the device hasn't sent any
+        assert_eq!(input.pop_pending_event(), None);
+
+        // Simulate device sending an event by writing to the event queue
+        let test_event = InputEvent {
+            event_type: 1,
+            code: 2,
+            value: 3,
+        };
+        state
+            .lock()
+            .unwrap()
+            .write_to_queue::<QUEUE_SIZE>(QUEUE_EVENT, test_event.as_bytes());
+
+        // Without blocking, we should be able to pop the event
+        let event = input.pop_pending_event();
+        assert!(event.is_some(), "Event should be available when not blocked");
+
+        // Simulate device sending another event
+        state
+            .lock()
+            .unwrap()
+            .write_to_queue::<QUEUE_SIZE>(QUEUE_EVENT, test_event.as_bytes());
+
+        // Block the event queue
+        input.block_event_queue();
+
+        // Now pop_pending_event should return None even though there's an event
+        assert_eq!(
+            input.pop_pending_event(),
+            None,
+            "pop_pending_event should return None when blocked"
+        );
+
+        // Try multiple times to ensure it consistently returns None
+        assert_eq!(
+            input.pop_pending_event(),
+            None,
+            "pop_pending_event should still return None when blocked"
+        );
+
+        // Unblock the event queue
+        input.unblock_event_queue();
+
+        // Now we should be able to pop the event again
+        let event = input.pop_pending_event();
+        assert!(event.is_some(), "Event should be available after unblocking");
     }
 }
